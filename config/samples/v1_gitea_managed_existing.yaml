@@ -1,0 +1,81 @@
+apiVersion: hyperspike.io/v1
+kind: Gitea
+metadata:
+  name: forgejo-next
+  namespace: forgejo
+spec:
+  managementPolicy: Managed
+  deletionPolicy: Retain
+  image: codeberg.org/forgejo/forgejo:16.0.2-rootless
+  rootless: true
+
+  # During migration this points to the API token already provisioned for the
+  # existing instance. The operator never copies the token into the CR.
+  connection:
+    adminTokenSecretRef:
+      name: forgejo-operator-admin
+      key: token
+
+  postgres:
+    existing:
+      host: pg-infra-rw.pg-infra.svc
+      port: 5432
+      databaseSecretRef:
+        name: forgejo-pg-infra
+        key: database
+      credentialsSecretRef:
+        name: forgejo-pg-infra
+      usernameKey: username
+      passwordKey: password
+      sslMode: disable
+
+  objectStorage:
+    type: s3
+    endpoint: s3.s3.svc:7070
+    region: us-east-1
+    existing:
+      credentialsSecretRef:
+        name: forgejo-storage
+      bucketSecretRef:
+        name: forgejo-storage
+        key: S3_BUCKET
+      secure: false
+
+  persistence:
+    data:
+      existingClaim: forgejo-data
+      mountPath: /data
+    config:
+      existingClaim: forgejo-config
+      mountPath: /var/lib/gitea
+
+  workload:
+    # Keep this at zero while the old pod mounts the RWO data PVC. Distinct
+    # names permit manifest validation without fighting the current workload.
+    replicas: 0
+    name: forgejo-managed
+    bootstrapAdmin: false
+    repositoryRoot: /data/git/repositories
+    appIniPath: /var/lib/gitea/custom/conf/app.ini
+    sshEnabled: true
+    service:
+      name: forgejo-managed
+      httpPort: 3000
+      sshPort: 2222
+    env:
+      - name: GITEA__server__ROOT_URL
+        value: https://git.example.test/
+      - name: GITEA__security__INTERNAL_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: forgejo-tokens
+            key: INTERNAL_TOKEN
+      - name: GITEA__security__SECRET_KEY
+        valueFrom:
+          secretKeyRef:
+            name: forgejo-tokens
+            key: SECRET_KEY
+
+  # Keep the current ingress while the replacement is prepared.
+  ingress:
+    managed: false

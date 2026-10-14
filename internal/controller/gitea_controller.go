@@ -1,0 +1,3038 @@
+/*
+Copyright 2024.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/tools/events"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	hclient "hyperspike.io/gitea-operator/internal/client"
+
+	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmetav1 "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	zalandov1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
+	hyperv1 "hyperspike.io/gitea-operator/api/v1"
+	valkeyv1 "hyperspike.io/valkey-operator/api/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	netv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func init() {
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
+		panic(fmt.Sprintf("crypto/rand is unavailable: Read() failed %#v", err))
+	}
+}
+
+func randString(n int) (string, error) {
+	const letters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
+	ret := make([]byte, n)
+	for i := 0; i < n; i++ {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		if err != nil {
+			return "", err
+		}
+		ret[i] = letters[num.Int64()]
+	}
+
+	return string(ret), nil
+}
+
+const (
+	GCS             = "gcs"
+	S3              = "s3"
+	Gitea           = "gitea"
+	Forgejo         = "forgejo"
+	Metrics         = "metrics"
+	objectFinalizer = "object.hyperspike.io/finalizer"
+	Cnpg            = "cnpg"
+	DATABASE        = "database"
+	PASSWORD        = "password"
+	USERNAME        = "username"
+	TLS             = "tls"
+	_CERTS          = "/certs"
+)
+
+// GiteaReconciler reconciles a Gitea object
+type GiteaReconciler struct {
+	client.Client
+	Recorder events.EventRecorder
+	Scheme   *runtime.Scheme
+}
+
+// +kubebuilder:rbac:groups=hyperspike.io,resources=gitea,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=hyperspike.io,resources=valkeys,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=hyperspike.io,resources=gitea/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=hyperspike.io,resources=gitea/finalizers,verbs=update
+// +kubebuilder:rbac:groups=cert-manager.io,resources=clusterissuers;issuers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts;secrets;services,verbs=create;delete;get;list;watch;update
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;update;watch;delete
+// +kubebuilder:rbac:groups="",resources=endpoints,verbs=create;delete;deletecollection;get;list;patch;update;watch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=create;delete;get;list;watch;update;patch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=create;delete;get;list;watch
+// +kubebuilder:rbac:groups=acid.zalan.do,resources=postgresqls,verbs=create;delete;get;list;watch
+// +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=create;delete;get;list;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=create;delete;get;list;watch
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings;roles,verbs=create;delete;get;list;watch
+
+// Reconcile is part of the main kubernetes reconciliation loop which aims to
+// move the current state of the cluster closer to the desired state.
+// TODO(user): Modify the Reconcile function to compare the state specified by
+// the Gitea object against the actual cluster state, and then
+// perform operations to make the cluster state reflect the state specified by
+// the user.
+//
+// For more details, check Reconcile and its Result here:
+// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.18.2/pkg/reconcile
+func (r *GiteaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	var gitea hyperv1.Gitea
+	if err := r.Get(ctx, req.NamespacedName, &gitea); err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		logger.Error(err, "failed to get Gitea")
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	res, err := r.reconcileGitea(ctx, &gitea)
+	if err != nil {
+		return res, err
+	}
+
+	return res, nil
+}
+
+//nolint:unparam
+func (r *GiteaReconciler) setCondition(ctx context.Context, gitea *hyperv1.Gitea,
+	typeName string, status metav1.ConditionStatus, reason string, message string) error {
+	logger := log.FromContext(ctx)
+
+	condition := metav1.Condition{
+		Type:               typeName,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: gitea.Generation,
+	}
+	meta.SetStatusCondition(&gitea.Status.Conditions, condition)
+	gitea.Status.ObservedGeneration = gitea.Generation
+
+	if err := r.Client.Status().Update(ctx, gitea); err != nil {
+		logger.Error(err, "Gitea status update failed.")
+		return err
+	}
+	return nil
+}
+
+//nolint:unparam,gocyclo
+func (r *GiteaReconciler) reconcileGitea(ctx context.Context, gitea *hyperv1.Gitea) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	if gitea.Spec.ManagementPolicy == hyperv1.ManagementPolicyExternal {
+		return r.reconcileExternal(ctx, gitea)
+	}
+	if !gitea.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(gitea, objectFinalizer) {
+			if gitea.Spec.DeletionPolicy == hyperv1.DeletionPolicyDelete &&
+				gitea.Spec.ObjectStorage != nil && gitea.Spec.ObjectStorage.Existing == nil {
+				if err := r.deleteObject(ctx, gitea); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+			controllerutil.RemoveFinalizer(gitea, objectFinalizer)
+			if err := r.Update(ctx, gitea); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if gitea.Spec.Postgres.Existing == nil {
+		if gitea.Spec.Postgres.Provider == Cnpg {
+			if err := r.upsertCNPG(ctx, gitea); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else {
+			if err := r.upsertPG(ctx, gitea); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	if gitea.Spec.Prometheus {
+		if err := r.upsertServiceMonitorPG(ctx, gitea); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.upsertMetricsServicePG(ctx, gitea); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if !gitea.Status.Ready {
+		if err := r.setCondition(ctx, gitea, "DatabaseReady", "False", "DatabaseReady", "database still provisioning"); err != nil {
+			return ctrl.Result{}, err
+		}
+		if gitea.Spec.Valkey {
+			if err := r.setCondition(ctx, gitea, "CacheReady", "False", "CacheReady", "valkey still provisioning"); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	if gitea.Spec.Valkey {
+		if err := r.upsertValkey(ctx, gitea); err != nil {
+			return ctrl.Result{}, err
+		}
+		vkUp, _ := r.valkeyRunning(ctx, gitea)
+		if !vkUp {
+			return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, nil
+		}
+	}
+	// spool up valkey and postgres in parallel
+	pgUp, err := r.postgresReady(ctx, gitea)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !pgUp {
+		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, nil
+	}
+	if gitea.Spec.TLS {
+		if err := r.upsertCertificate(ctx, gitea); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if !gitea.Status.Ready {
+		if err := r.setCondition(ctx, gitea, "DatabaseReady", "True", "DatabaseReady", "database ready"); err != nil {
+			return ctrl.Result{}, err
+		}
+		if gitea.Spec.Valkey {
+			if err := r.setCondition(ctx, gitea, "CacheReady", "True", "CacheReady", "valkey ready"); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Running",
+		"DatabaseUp", "Postgres  %s-%s is running", gitea.Name, gitea.Name)
+	if gitea.Spec.Valkey {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Running",
+			"CacheUp", "Valkey %s is running", gitea.Name+"-valkey")
+	}
+	access, secret, bucket := "", "", ""
+	if gitea.Spec.ObjectStorage != nil {
+		if gitea.Spec.ObjectStorage.Existing != nil {
+			var err error
+			access, secret, bucket, err = r.getExistingObjectStorage(ctx, gitea)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		} else {
+			var err error
+			access, secret, err = r.upsertObject(ctx, gitea)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	if gitea.Spec.Prometheus {
+		if err := r.upsertServiceMonitor(ctx, gitea); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.upsertMetricsService(ctx, gitea); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if err := r.upsertGiteaSvc(ctx, gitea); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.upsertGiteaSa(ctx, gitea); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.upsertGiteaRole(ctx, gitea); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.upsertGiteaRoleBinding(ctx, gitea); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.upsertSecret(ctx, gitea, gitea.Name+"-init", map[string]string{
+		"configure_gpg_environment.sh": `#!/usr/bin/env bash
+set -eu
+
+gpg --batch --import /raw/private.asc`,
+		"init_directory_structure.sh": `#!/usr/bin/env bash
+
+set -euo pipefail
+
+set -x
+
+mkdir -p "${GITEA_WORK_DIR}/git/.ssh"
+chmod -R 700 "${GITEA_WORK_DIR}/git/.ssh"
+mkdir -p "${GITEA_WORK_DIR}/ssh"
+chmod -R 700 "${GITEA_WORK_DIR}"
+chown 1000 -R "${GITEA_WORK_DIR}"
+mkdir -p "$(dirname "${GITEA_APP_INI}")"
+
+# prepare temp directory structure
+mkdir -p "${GITEA_TEMP}"
+chown 1000:1000 "${GITEA_TEMP}"
+chmod ug+rwx "${GITEA_TEMP}"`,
+		"configure_gitea.sh": `#!/usr/bin/env bash
+
+set -euo pipefail
+
+echo '==== BEGIN GITEA CONFIGURATION ===='
+
+{ # try
+	gitea migrate
+} || { # catch
+	echo "Gitea migrate might fail due to database connection...This init-container will try again in a few seconds"
+	exit 1
+}
+
+function test_redis_connection() {
+	local RETRY=0
+	local MAX=30
+
+	echo 'Wait for redis to become available...'
+	until [ "${RETRY}" -ge "${MAX}" ]; do
+		nc -vz -w2 gitea-redis-cluster-headless.default.svc.cluster.local 6379 && break
+		RETRY=$[${RETRY}+1]
+		echo "...not ready yet (${RETRY}/${MAX})"
+	done
+
+	if [ "${RETRY}" -ge "${MAX}" ]; then
+		echo "Redis not reachable after '${MAX}' attempts!"
+		exit 1
+	fi
+}
+
+# test_redis_connection
+
+function configure_admin_user() {
+	local full_admin_list=$(gitea admin user list --admin)
+	local actual_user_table=''
+
+	# We might have distorted output due to warning logs, so we have to detect the actual user table by its headline and trim output above that line
+	local regex="(.*)(ID\s+Username\s+Email\s+IsActive.*)"
+	if [[ "${full_admin_list}" =~ $regex ]]; then
+		actual_user_table=$(echo "${BASH_REMATCH[2]}" | tail -n+2) # tail'ing to drop the table headline
+	else
+		# This code block should never be reached, as long as the output table header remains the same.
+		# If this code block is reached, the regex doesn't match anymore and we probably have to adjust this script.
+
+		echo "ERROR: 'configure_admin_user' was not able to determine the current list of admin users."
+		echo "       Please review the output of 'gitea admin user list --admin' shown below."
+		echo "       If you think it is an issue with the Helm Chart provisioning, file an issue at https://gitea.com/gitea/helm-chart/issues."
+		echo "DEBUG: Output of 'gitea admin user list --admin'"
+		echo "--"
+		echo "${full_admin_list}"
+		echo "--"
+		exit 1
+	fi
+
+	local ACCOUNT_ID=$(echo "${actual_user_table}" | grep -E "\s+${GITEA_ADMIN_USERNAME}\s+" | awk -F " " "{printf \$1}")
+	if [[ -z "${ACCOUNT_ID}" ]]; then
+		echo "No admin user '${GITEA_ADMIN_USERNAME}' found. Creating now..."
+		gitea admin user create --admin --username "${GITEA_ADMIN_USERNAME}" --password "${GITEA_ADMIN_PASSWORD}" --email "gitea@local.domain" --must-change-password=false
+		echo '...created.'
+	else
+		echo "Admin account '${GITEA_ADMIN_USERNAME}' already exist. Running update to sync password..."
+		gitea admin user change-password --username "${GITEA_ADMIN_USERNAME}" --password "${GITEA_ADMIN_PASSWORD} --must-change-password=false"
+		echo '...password sync done.'
+	fi
+}
+
+if [[ "${FORGEJO_BOOTSTRAP_ADMIN:-true}" == "true" ]]; then
+	configure_admin_user
+fi
+
+function configure_ldap() {
+        echo 'no ldap configuration... skipping.'
+}
+
+configure_ldap
+
+function configure_oauth() {
+        echo 'no oauth configuration... skipping.'
+}
+
+configure_oauth
+
+echo '==== END GITEA CONFIGURATION ===='`,
+	}, false); err != nil {
+		return ctrl.Result{}, err
+	}
+	password, err := r.getValkeyPassword(ctx, gitea)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	inlineConfig := map[string]string{
+		"_generals_": "",
+		"cache":      cacheSvc(gitea, password),
+		/* "database": `DB_TYPE=postgres
+		HOST=gitea-postgresql-ha-pgpool.default.svc.cluster.local:5432
+		NAME=gitea
+		PASSWD=gitea
+		USER=gitea`, */
+		"indexer":    "ISSUE_INDEXER_TYPE=db",
+		"metrics":    metricsSvc(gitea),
+		"queue":      queueSvc(gitea, password),
+		"repository": "ROOT=" + repositoryRoot(gitea),
+		"security":   "INSTALL_LOCK=true",
+		"server":     serverSvc(gitea),
+		"session":    sessionSvc(gitea, password),
+	}
+	if gitea.Spec.ObjectStorage != nil && gitea.Spec.ObjectStorage.Existing == nil {
+		//inlineConfig["storage.object"] = storageSvc(gitea, access, secret)
+		inlineConfig["storage"] = storageSvc(gitea, access, secret, bucket)
+		inlineConfig["storage.lfs"] = storageSvc(gitea, access, secret, bucket)
+		inlineConfig["attachment"] = storageSvc(gitea, access, secret, bucket)
+		inlineConfig["storage.attachment"] = storageSvc(gitea, access, secret, bucket)
+		inlineConfig["storage.avatars"] = storageSvc(gitea, access, secret, bucket)
+		inlineConfig["storage.packages"] = storageSvc(gitea, access, secret, bucket)
+		inlineConfig["storage.action_log"] = storageSvc(gitea, access, secret, bucket)
+		inlineConfig["storage.action_artifacts"] = storageSvc(gitea, access, secret, bucket)
+	}
+	if err := r.upsertSecret(ctx, gitea, gitea.Name+"-inline-config", inlineConfig, false); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if bootstrapAdmin(gitea) {
+		rs, err := randString(14)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.upsertSecret(ctx, gitea, gitea.Name+"-admin", map[string]string{USERNAME: Gitea, PASSWORD: rs}, true); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if err := r.upsertSecret(ctx, gitea, gitea.Name+"-config", map[string]string{
+		"assertions": "",
+		"config_environment.sh": `#!/usr/bin/env bash
+    set -euo pipefail
+
+    function env2ini::log() {
+      printf "${1}\n"
+    }
+
+    function env2ini::read_config_to_env() {
+      local section="${1}"
+      local line="${2}"
+
+      if [[ -z "${line}" ]]; then
+        # skip empty line
+        return
+      fi
+      
+      # 'xargs echo -n' trims all leading/trailing whitespaces and a trailing new line
+      local setting="$(awk -F '=' '{print $1}' <<< "${line}" | xargs echo -n)"
+
+      if [[ -z "${setting}" ]]; then
+        env2ini::log '  ! invalid setting'
+        exit 1
+      fi
+
+      local value=''
+      local regex="^${setting}(\s*)=(\s*)(.*)"
+      if [[ $line =~ $regex ]]; then
+        value="${BASH_REMATCH[3]}"
+      else
+        env2ini::log '  ! invalid setting'
+        exit 1
+      fi
+
+      env2ini::log "    + '${setting}'"
+
+      if [[ -z "${section}" ]]; then
+        export "GITEA____${setting^^}=${value}"                           # '^^' makes the variable content uppercase
+        return
+      fi
+
+      local masked_section="${section//./_0X2E_}"                            # '//' instructs to replace all matches
+      masked_section="${masked_section//-/_0X2D_}"
+
+      export "GITEA__${masked_section^^}__${setting^^}=${value}"        # '^^' makes the variable content uppercase
+    }
+
+    function env2ini::reload_preset_envs() {
+      env2ini::log "Reloading preset envs..."
+
+      while read -r line; do
+        if [[ -z "${line}" ]]; then
+          # skip empty line
+          return
+        fi
+
+        # 'xargs echo -n' trims all leading/trailing whitespaces and a trailing new line
+        local setting="$(awk -F '=' '{print $1}' <<< "${line}" | xargs echo -n)"
+
+        if [[ -z "${setting}" ]]; then
+          env2ini::log '  ! invalid setting'
+          exit 1
+        fi
+
+        local value=''
+        local regex="^${setting}(\s*)=(\s*)(.*)"
+        if [[ $line =~ $regex ]]; then
+          value="${BASH_REMATCH[3]}"
+        else
+          env2ini::log '  ! invalid setting'
+          exit 1
+        fi
+
+        env2ini::log "  + '${setting}'"
+
+        export "${setting^^}=${value}"                           # '^^' makes the variable content uppercase
+      done < "/tmp/existing-envs"
+
+      rm /tmp/existing-envs
+    }
+
+
+    function env2ini::process_config_file() {
+      local config_file="${1}"
+      local section="$(basename "${config_file}")"
+
+      if [[ $section == '_generals_' ]]; then
+        env2ini::log "  [ini root]"
+        section=''
+      else
+        env2ini::log "  ${section}"
+      fi
+
+      while read -r line; do
+        env2ini::read_config_to_env "${section}" "${line}"
+      done < <(awk 1 "${config_file}")                             # Helm .toYaml trims the trailing new line which breaks line processing; awk 1 ... adds it back while reading
+    }
+
+    function env2ini::load_config_sources() {
+      local path="${1}"
+
+      if [[ -d "${path}" ]]; then
+        env2ini::log "Processing $(basename "${path}")..."
+
+        while read -d '' configFile; do
+          env2ini::process_config_file "${configFile}"
+        done < <(find "${path}" -type l -not -name '..data' -print0)
+
+        env2ini::log "\n"
+      fi
+    }
+
+    function env2ini::generate_initial_secrets() {
+      # These environment variables will either be
+      #   - overwritten with user defined values,
+      #   - initially used to set up Gitea
+      # Anyway, they won't harm existing app.ini files
+
+      export GITEA__SECURITY__INTERNAL_TOKEN=$(gitea generate secret INTERNAL_TOKEN)
+      export GITEA__SECURITY__SECRET_KEY=$(gitea generate secret SECRET_KEY)
+      export GITEA__OAUTH2__JWT_SECRET=$(gitea generate secret JWT_SECRET)
+      export GITEA__SERVER__LFS_JWT_SECRET=$(gitea generate secret LFS_JWT_SECRET)
+
+      env2ini::log "...Initial secrets generated\n"
+    }
+    
+    # save existing envs prior to script execution. Necessary to keep order of preexisting and custom envs
+    env | (grep -e '^GITEA__' || [[ $? == 1 ]]) > /tmp/existing-envs
+    
+    # MUST BE CALLED BEFORE OTHER CONFIGURATION
+    env2ini::generate_initial_secrets
+
+    env2ini::load_config_sources '/env-to-ini-mounts/inlines/'
+    env2ini::load_config_sources '/env-to-ini-mounts/additionals/'
+
+    # load existing envs to override auto generated envs
+    env2ini::reload_preset_envs
+
+    env2ini::log "=== All configuration sources loaded ===\n"
+
+    # safety to prevent rewrite of secret keys if an app.ini already exists
+    if [ -f ${GITEA_APP_INI} ]; then
+      env2ini::log 'An app.ini file already exists. To prevent overwriting secret keys, these settings are dropped and remain unchanged:'
+      env2ini::log '  - security.INTERNAL_TOKEN'
+      env2ini::log '  - security.SECRET_KEY'
+      env2ini::log '  - oauth2.JWT_SECRET'
+      env2ini::log '  - server.LFS_JWT_SECRET'
+
+      unset GITEA__SECURITY__INTERNAL_TOKEN
+      unset GITEA__SECURITY__SECRET_KEY
+      unset GITEA__OAUTH2__JWT_SECRET
+      unset GITEA__SERVER__LFS_JWT_SECRET
+    fi
+
+    environment-to-ini -o $GITEA_APP_INI`,
+	}, false); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.upsertGiteaSts(ctx, gitea); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.upsertPDB(ctx, gitea); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.upsertGiteaIngress(ctx, gitea); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	up, _ := r.podUP(ctx, gitea)
+	if !up {
+		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, nil
+	}
+	logger.Info("pod up", "sts", gitea.Name)
+	if !r.apiUP(ctx, gitea) {
+		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, nil
+	}
+	logger.Info("api is up", "sts", gitea.Name)
+	if bootstrapAdmin(gitea) {
+		if err := r.adminToken(ctx, gitea); err != nil {
+			_ = r.setInstanceStatus(ctx, gitea, false, "AdminTokenFailed", err.Error(), "")
+			return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, nil
+		}
+	} else {
+		if gitea.Spec.Connection.AdminTokenSecretRef == nil {
+			return ctrl.Result{}, fmt.Errorf("managed instances with workload.bootstrapAdmin=false require connection.adminTokenSecretRef")
+		}
+		if _, err := hclient.BuildForInstance(ctx, r.Client, gitea); err != nil {
+			endpoint, _ := hclient.Endpoint(gitea)
+			_ = r.setInstanceStatus(ctx, gitea, false, "ConnectionFailed", err.Error(), endpoint)
+			return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
+		}
+	}
+	endpoint, err := hclient.Endpoint(gitea)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.setInstanceStatus(ctx, gitea, true, "ManagedReady", "managed Forgejo workload and API are ready", endpoint); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+func (r *GiteaReconciler) postgresReady(ctx context.Context, gitea *hyperv1.Gitea) (bool, error) {
+	if gitea.Spec.Postgres.Existing == nil {
+		return r.pgRunning(ctx, gitea)
+	}
+	database := gitea.Spec.Postgres.Existing
+	if database.Host == "" || database.CredentialsSecretRef.Name == "" {
+		return false, fmt.Errorf("postgres.existing requires host and credentialsSecretRef.name")
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: database.CredentialsSecretRef.Name, Namespace: gitea.Namespace}, secret); err != nil {
+		return false, err
+	}
+	usernameKey := database.UsernameKey
+	if usernameKey == "" {
+		usernameKey = USERNAME
+	}
+	passwordKey := database.PasswordKey
+	if passwordKey == "" {
+		passwordKey = PASSWORD
+	}
+	if len(secret.Data[usernameKey]) == 0 || len(secret.Data[passwordKey]) == 0 {
+		return false, fmt.Errorf("postgres credentials secret %s/%s must contain non-empty %q and %q keys", gitea.Namespace, secret.Name, usernameKey, passwordKey)
+	}
+	if _, err := r.existingDatabaseName(ctx, gitea); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *GiteaReconciler) existingDatabaseName(ctx context.Context, gitea *hyperv1.Gitea) (string, error) {
+	existing := gitea.Spec.Postgres.Existing
+	if existing == nil {
+		return "", fmt.Errorf("postgres.existing is not configured")
+	}
+	if existing.Database != "" && existing.DatabaseSecretRef != nil {
+		return "", fmt.Errorf("postgres.existing.database and databaseSecretRef are mutually exclusive")
+	}
+	if existing.Database != "" {
+		return existing.Database, nil
+	}
+	if existing.DatabaseSecretRef == nil || existing.DatabaseSecretRef.Name == "" || existing.DatabaseSecretRef.Key == "" {
+		return "", fmt.Errorf("postgres.existing requires database or databaseSecretRef")
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: existing.DatabaseSecretRef.Name, Namespace: gitea.Namespace}, secret); err != nil {
+		return "", err
+	}
+	database := string(secret.Data[existing.DatabaseSecretRef.Key])
+	if database == "" {
+		return "", fmt.Errorf("postgres database secret %s/%s key %q is empty", gitea.Namespace, secret.Name, existing.DatabaseSecretRef.Key)
+	}
+	return database, nil
+}
+
+func (r *GiteaReconciler) reconcileExternal(ctx context.Context, gitea *hyperv1.Gitea) (ctrl.Result, error) {
+	if !gitea.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+	if gitea.Spec.Connection.AdminTokenSecretRef == nil {
+		err := fmt.Errorf("external instances require spec.connection.adminTokenSecretRef")
+		_ = r.setInstanceStatus(ctx, gitea, false, "InvalidConnection", err.Error(), "")
+		return ctrl.Result{}, err
+	}
+	if gitea.Spec.Connection.URL == "" && gitea.Spec.Connection.Service == nil {
+		err := fmt.Errorf("external instances require spec.connection.url or spec.connection.service")
+		_ = r.setInstanceStatus(ctx, gitea, false, "InvalidConnection", err.Error(), "")
+		return ctrl.Result{}, err
+	}
+
+	endpoint, err := hclient.Endpoint(gitea)
+	if err != nil {
+		_ = r.setInstanceStatus(ctx, gitea, false, "InvalidConnection", err.Error(), "")
+		return ctrl.Result{}, err
+	}
+	if _, err := hclient.BuildForInstance(ctx, r.Client, gitea); err != nil {
+		_ = r.setInstanceStatus(ctx, gitea, false, "ConnectionFailed", err.Error(), endpoint)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+	if err := r.setInstanceStatus(ctx, gitea, true, "Connected", "Forgejo API is reachable", endpoint); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+func (r *GiteaReconciler) setInstanceStatus(ctx context.Context, gitea *hyperv1.Gitea, ready bool, reason, message, endpoint string) error {
+	conditionStatus := metav1.ConditionFalse
+	if ready {
+		conditionStatus = metav1.ConditionTrue
+	}
+	meta.SetStatusCondition(&gitea.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             conditionStatus,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: gitea.Generation,
+	})
+	gitea.Status.Ready = ready
+	gitea.Status.Endpoint = endpoint
+	gitea.Status.ObservedGeneration = gitea.Generation
+	return r.Client.Status().Update(ctx, gitea)
+}
+
+func labels(name string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":      Forgejo,
+		"app.kubernetes.io/instance":  name,
+		"app.kubernetes.io/component": "deployment",
+		"app.kubernetes.io/part-of":   Forgejo,
+	}
+}
+
+func (r *GiteaReconciler) reconcileStatefulOwnership(ctx context.Context, gitea *hyperv1.Gitea, object client.Object) error {
+	before := append([]metav1.OwnerReference(nil), object.GetOwnerReferences()...)
+	if gitea.Spec.DeletionPolicy == hyperv1.DeletionPolicyDelete {
+		if err := controllerutil.SetControllerReference(gitea, object, r.Scheme); err != nil {
+			return err
+		}
+	} else {
+		retained := make([]metav1.OwnerReference, 0, len(before))
+		for _, owner := range before {
+			if owner.UID != gitea.UID {
+				retained = append(retained, owner)
+			}
+		}
+		object.SetOwnerReferences(retained)
+	}
+	if apiequality.Semantic.DeepEqual(before, object.GetOwnerReferences()) {
+		return nil
+	}
+	return r.Update(ctx, object)
+}
+
+// upsertCNPG - Create or update a CNPG cluster {{{
+func (r *GiteaReconciler) upsertCNPG(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = DATABASE
+
+	cnpg := &cnpgv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-db",
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+		Spec: cnpgv1.ClusterSpec{
+			Instances: 2,
+			ImageName: "ghcr.io/cloudnative-pg/postgresql:17",
+			StorageConfiguration: cnpgv1.StorageConfiguration{
+				Size: "15Gi",
+			},
+			Bootstrap: &cnpgv1.BootstrapConfiguration{
+				InitDB: &cnpgv1.BootstrapInitDB{
+					Database: gitea.Name,
+					Owner:    gitea.Name,
+				},
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("10m"),
+					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1500m"),
+					corev1.ResourceMemory: resource.MustParse("1280Mi"),
+				},
+			},
+		},
+	}
+
+	if gitea.Spec.DeletionPolicy == hyperv1.DeletionPolicyDelete {
+		if err := controllerutil.SetControllerReference(gitea, cnpg, r.Scheme); err != nil {
+			return err
+		}
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-db", Namespace: gitea.Namespace}, cnpg)
+	if err != nil && errors.IsNotFound(err) {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"ClusterCreate", "CNPG Cluster %s is being created", gitea.Name+"-db")
+		if err := r.Create(ctx, cnpg); err != nil {
+			logger.Error(err, "failed to create CNPG cluster")
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	return r.reconcileStatefulOwnership(ctx, gitea, cnpg)
+}
+
+// }}}
+
+// upsertPG - Create or update a postgres cluster {{{
+func (r *GiteaReconciler) upsertPG(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	crb := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   gitea.Name,
+			Labels: labels(gitea.Name),
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "postgres-pod",
+				Namespace: gitea.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "postgres-pod",
+		},
+	}
+	// dont set owner here
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name, Namespace: gitea.Namespace}, crb)
+	if err != nil && errors.IsNotFound(err) {
+		if err := r.Create(ctx, crb); err != nil {
+			logger.Error(err, "failed to create postgres crb")
+			return err
+		}
+	} else {
+		return err
+	}
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = DATABASE
+	pg := &zalandov1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-" + gitea.Name,
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+		Spec: zalandov1.PostgresSpec{
+			TeamID: gitea.Name,
+			Volume: zalandov1.Volume{
+				Size: "15Gi",
+			},
+			NumberOfInstances: int32(2),
+			Resources: &zalandov1.Resources{
+				ResourceRequests: zalandov1.ResourceDescription{
+					CPU:    ptrString("10m"),
+					Memory: ptrString("128Mi"),
+				},
+				ResourceLimits: zalandov1.ResourceDescription{
+					CPU:    ptrString("1500m"),
+					Memory: ptrString("1280Mi"),
+				},
+			},
+			Users: map[string]zalandov1.UserFlags{
+				gitea.Name: {
+					"superuser",
+					"createdb",
+				},
+			},
+			Databases: map[string]string{
+				gitea.Name: gitea.Name,
+			},
+			PostgresqlParam: zalandov1.PostgresqlParam{
+				PgVersion: "17",
+				Parameters: map[string]string{
+					"shared_preload_libraries": "bg_mon,pg_stat_statements,pgextwlist,pg_auth_mon,set_user,timescaledb,pg_cron,pg_stat_kcache,pgaudit",
+				},
+			},
+		},
+	}
+	if gitea.Spec.Prometheus {
+		pg.Spec.Sidecars = []zalandov1.Sidecar{
+			{
+				Name:        "exporter",
+				DockerImage: "quay.io/prometheuscommunity/postgres-exporter:v0.15.0",
+				Ports: []corev1.ContainerPort{
+					{
+						Name:          "metrics",
+						ContainerPort: 9187,
+						Protocol:      corev1.ProtocolTCP,
+					},
+				},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "DATA_SOURCE_URI",
+						Value: "localhost:5432/postgres?sslmode=disable",
+					},
+					{
+						Name: "DATA_SOURCE_USER",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								Key: USERNAME,
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: "postgres." + gitea.Name + "-" + gitea.Name + ".credentials.postgresql.acid.zalan.do",
+								},
+							},
+						},
+					},
+					{
+						Name: "DATA_SOURCE_PASS",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								Key: PASSWORD,
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: "postgres." + gitea.Name + "-" + gitea.Name + ".credentials.postgresql.acid.zalan.do",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	if gitea.Spec.DeletionPolicy == hyperv1.DeletionPolicyDelete {
+		if err := controllerutil.SetControllerReference(gitea, pg, r.Scheme); err != nil {
+			return err
+		}
+	}
+	err = r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-" + gitea.Name, Namespace: gitea.Namespace}, pg)
+	if err != nil && errors.IsNotFound(err) {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"CreateDB", "Postgres %s is being created", gitea.Name+"-"+gitea.Name)
+		if err := r.Create(ctx, pg); err != nil {
+			logger.Error(err, "failed to create postgres")
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	return r.reconcileStatefulOwnership(ctx, gitea, pg)
+}
+
+// }}}
+
+// pgRunning - check the postgres CR for state {{{
+func (r *GiteaReconciler) pgRunning(ctx context.Context, gitea *hyperv1.Gitea) (bool, error) {
+	if gitea.Spec.Postgres.Provider == Cnpg {
+		cnpg := &cnpgv1.Cluster{}
+		if err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-db", Namespace: gitea.Namespace}, cnpg); err != nil {
+			return false, err
+		}
+		if cnpg.Status.Phase == cnpgv1.PhaseHealthy {
+			return true, nil
+		}
+		return false, nil
+	}
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = DATABASE
+	pg := &zalandov1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-" + gitea.Name,
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+	}
+	if err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-" + gitea.Name, Namespace: gitea.Namespace}, pg); err != nil {
+		return false, err
+	}
+	if pg.Status.PostgresClusterStatus == "Running" {
+		return true, nil
+	}
+	return false, nil
+}
+
+// }}}
+
+// upsertValkey - Create or update a valkey cluster {{{
+func (r *GiteaReconciler) upsertValkey(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = "cache"
+	vk := &valkeyv1.Valkey{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-valkey",
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+		Spec: valkeyv1.ValkeySpec{
+			Shards:            3,
+			VolumePermissions: true,
+			Prometheus:        gitea.Spec.Prometheus,
+			PrometheusLabels:  gitea.Spec.PrometheusLabels,
+		},
+	}
+	if gitea.Spec.TLS {
+		vk.Spec.TLS = true
+		vk.Spec.CertIssuer = gitea.Spec.CertIssuer
+		vk.Spec.CertIssuerType = gitea.Spec.CertIssuerType
+	}
+	if gitea.Spec.DeletionPolicy == hyperv1.DeletionPolicyDelete {
+		if err := controllerutil.SetControllerReference(gitea, vk, r.Scheme); err != nil {
+			return err
+		}
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-valkey", Namespace: gitea.Namespace}, vk)
+	if err != nil && errors.IsNotFound(err) {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"CreateCache", "Valkey %s is being created", gitea.Name+"-valkey")
+		if err := r.Create(ctx, vk); err != nil {
+			logger.Error(err, "failed to create valkey")
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	return r.reconcileStatefulOwnership(ctx, gitea, vk)
+}
+
+// }}}
+
+// valkeyRunning - check the valkey CR for state {{{
+func (r *GiteaReconciler) valkeyRunning(ctx context.Context, gitea *hyperv1.Gitea) (bool, error) {
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = "cache"
+	vk := &valkeyv1.Valkey{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-valkey",
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+	}
+	if err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-valkey", Namespace: gitea.Namespace}, vk); err != nil {
+		return false, err
+	}
+	if vk.Status.Ready {
+		return true, nil
+	}
+	return false, nil
+}
+
+// }}}
+
+func (r *GiteaReconciler) getObjectStorage(ctx context.Context, gitea *hyperv1.Gitea) (string, string, error) {
+	access, secret := "", ""
+	if gitea.Spec.ObjectStorage == nil {
+		return access, secret, nil
+	}
+	scrt := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-object",
+			Namespace: gitea.Namespace,
+		},
+	}
+	if err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-object", Namespace: gitea.Namespace}, scrt); err != nil {
+		return access, secret, err
+	}
+
+	access = string(scrt.Data["access"])
+	secret = string(scrt.Data["secret"])
+	return access, secret, nil
+}
+
+func (r *GiteaReconciler) getExistingObjectStorage(ctx context.Context, gitea *hyperv1.Gitea) (string, string, string, error) {
+	existing := gitea.Spec.ObjectStorage.Existing
+	if existing == nil || existing.CredentialsSecretRef.Name == "" {
+		return "", "", "", fmt.Errorf("objectStorage.existing.credentialsSecretRef.name is required")
+	}
+	credentials := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: existing.CredentialsSecretRef.Name, Namespace: gitea.Namespace}, credentials); err != nil {
+		return "", "", "", err
+	}
+	accessKey := existing.AccessKey
+	if accessKey == "" {
+		accessKey = "AWS_ACCESS_KEY_ID"
+	}
+	secretKey := existing.SecretKey
+	if secretKey == "" {
+		secretKey = "AWS_SECRET_ACCESS_KEY"
+	}
+	access := string(credentials.Data[accessKey])
+	secret := string(credentials.Data[secretKey])
+	if access == "" || secret == "" {
+		return "", "", "", fmt.Errorf("object storage credentials secret %s/%s must contain non-empty %q and %q keys", gitea.Namespace, credentials.Name, accessKey, secretKey)
+	}
+
+	bucket := existing.Bucket
+	if bucket != "" && existing.BucketSecretRef != nil {
+		return "", "", "", fmt.Errorf("objectStorage.existing.bucket and bucketSecretRef are mutually exclusive")
+	}
+	if existing.BucketSecretRef != nil {
+		bucketSecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{Name: existing.BucketSecretRef.Name, Namespace: gitea.Namespace}, bucketSecret); err != nil {
+			return "", "", "", err
+		}
+		bucket = string(bucketSecret.Data[existing.BucketSecretRef.Key])
+	}
+	if bucket == "" {
+		return "", "", "", fmt.Errorf("objectStorage.existing requires bucket or bucketSecretRef")
+	}
+	return access, secret, bucket, nil
+}
+
+func (r *GiteaReconciler) upsertGiteaSvc(ctx context.Context, gitea *hyperv1.Gitea) error {
+	if gitea.Spec.Workload.Service.Managed != nil && !*gitea.Spec.Workload.Service.Managed {
+		return nil
+	}
+	httpPort := gitea.Spec.Workload.Service.HTTPPort
+	if httpPort == 0 {
+		httpPort = 80
+	}
+	sshPort := gitea.Spec.Workload.Service.SSHPort
+	if sshPort == 0 {
+		sshPort = 2222
+	}
+	port := corev1.ServicePort{
+		Name:       "http",
+		Port:       httpPort,
+		TargetPort: intstr.FromString("http"),
+	}
+	if gitea.Spec.TLS {
+		if gitea.Spec.Workload.Service.HTTPPort == 0 {
+			port.Port = 443
+		}
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      managedServiceName(gitea),
+			Namespace: gitea.Namespace,
+		},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.Labels = labels(gitea.Name)
+		svc.Spec.Type = corev1.ServiceTypeClusterIP
+		svc.Spec.Selector = labels(gitea.Name)
+		svc.Spec.Ports = []corev1.ServicePort{port}
+		if sshEnabled(gitea) {
+			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{Name: "ssh", Port: sshPort, TargetPort: intstr.FromString("ssh")})
+		}
+		return controllerutil.SetControllerReference(gitea, svc, r.Scheme)
+	})
+	return err
+}
+
+func serverSvc(gitea *hyperv1.Gitea) string {
+	hostname := gitea.Spec.Ingress.Host
+	if hostname == "" {
+		hostname = "git.example.com"
+	}
+	service := `APP_DATA_PATH=` + dataMountPath(gitea) + `
+DOMAIN=` + hostname + `
+ENABLE_PPROF=false
+HTTP_PORT=3000
+PROTOCOL=http
+ROOT_URL=https://` + hostname + `
+SSH_DOMAIN=` + hostname + `
+SSH_LISTEN_PORT=2222
+SSH_PORT=22
+START_SSH_SERVER=` + strconv.FormatBool(sshEnabled(gitea))
+	if gitea.Spec.TLS {
+		service = `APP_DATA_PATH=` + dataMountPath(gitea) + `
+DOMAIN=` + hostname + `
+ENABLE_PPROF=false
+HTTP_PORT=3000
+PROTOCOL=https
+ROOT_URL=https://` + hostname + `
+SSH_DOMAIN=` + hostname + `
+SSH_LISTEN_PORT=2222
+SSH_PORT=22
+START_SSH_SERVER=` + strconv.FormatBool(sshEnabled(gitea)) + `
+CERT_FILE=/certs/tls.crt
+KEY_FILE=/certs/tls.key`
+	}
+	return service
+}
+
+func dataMountPath(gitea *hyperv1.Gitea) string {
+	if gitea.Spec.Persistence.Data.MountPath != "" {
+		return gitea.Spec.Persistence.Data.MountPath
+	}
+	return "/data"
+}
+
+func repositoryRoot(gitea *hyperv1.Gitea) string {
+	if gitea.Spec.Workload.RepositoryRoot != "" {
+		return gitea.Spec.Workload.RepositoryRoot
+	}
+	return dataMountPath(gitea) + "/git/gitea-repositories"
+}
+
+func bootstrapAdmin(gitea *hyperv1.Gitea) bool {
+	return gitea.Spec.Workload.BootstrapAdmin == nil || *gitea.Spec.Workload.BootstrapAdmin
+}
+
+func sshEnabled(gitea *hyperv1.Gitea) bool {
+	return gitea.Spec.Workload.SSHEnabled != nil && *gitea.Spec.Workload.SSHEnabled
+}
+
+func workloadName(gitea *hyperv1.Gitea) string {
+	if gitea.Spec.Workload.Name != "" {
+		return gitea.Spec.Workload.Name
+	}
+	return gitea.Name
+}
+
+func managedServiceName(gitea *hyperv1.Gitea) string {
+	if gitea.Spec.Workload.Service.Name != "" {
+		return gitea.Spec.Workload.Service.Name
+	}
+	return gitea.Name
+}
+
+func cacheSvc(gitea *hyperv1.Gitea, password string) string {
+	cache := "ADAPTER=memory"
+	if gitea.Spec.Valkey {
+		cache = `ADAPTER=redis
+HOST=redis+cluster://:` + password + "@" + gitea.Name + "-valkey." + gitea.Namespace + ".svc:6379/0?pool_size=100&idle_timeout=180s&"
+		if gitea.Spec.TLS {
+			cache = `ADAPTER=redis
+HOST=rediss+cluster://:` + password + "@" + gitea.Name + "-valkey." + gitea.Namespace + ".svc:6379/0?pool_size=100&idle_timeout=180s&skipverify=true"
+		}
+	}
+	return cache
+}
+
+func storageSvc(gitea *hyperv1.Gitea, access, secret, bucket string) string {
+	storage := `TYPE=local`
+	if gitea.Spec.ObjectStorage != nil {
+		region := gitea.Spec.ObjectStorage.Region
+		if region == "" && gitea.Spec.ObjectStorage.Type == GCS {
+			region = "auto"
+		}
+		if region == "" && gitea.Spec.ObjectStorage.Type == S3 {
+			if os.Getenv("AWS_REGION") != "" {
+				region = os.Getenv("AWS_REGION")
+			} else {
+				region = "us-east-1"
+			}
+		}
+		endPoint := gitea.Spec.ObjectStorage.Endpoint
+		if endPoint == "" && gitea.Spec.ObjectStorage.Type == GCS {
+			endPoint = "storage.googleapis.com"
+		}
+		if endPoint == "" && gitea.Spec.ObjectStorage.Type == S3 {
+			endPoint = fmt.Sprintf("s3.%s.amazonaws.com", region)
+		}
+		secure := true
+		if existing := gitea.Spec.ObjectStorage.Existing; existing != nil && existing.Secure != nil {
+			secure = *existing.Secure
+		}
+		if bucket == "" {
+			bucket = "gitea-operator-" + gitea.Name + "-" + gitea.Namespace + "-" + gitea.Spec.Ingress.Host
+		}
+		storage = `STORAGE_TYPE=minio
+MINIO_ACCESS_KEY_ID=` + access + `
+MINIO_ENDPOINT=` + endPoint + `
+MINIO_SECRET_ACCESS_KEY=` + secret + `
+MINIO_LOCATION=` + region + `
+MINIO_USE_SSL=` + strconv.FormatBool(secure) + `
+MINIO_BUCKET=` + bucket
+	}
+	return storage
+}
+
+func existingObjectStorageEnv(gitea *hyperv1.Gitea) []corev1.EnvVar {
+	if gitea.Spec.ObjectStorage == nil || gitea.Spec.ObjectStorage.Existing == nil {
+		return nil
+	}
+	object := gitea.Spec.ObjectStorage
+	existing := object.Existing
+	accessKey := existing.AccessKey
+	if accessKey == "" {
+		accessKey = "AWS_ACCESS_KEY_ID"
+	}
+	secretKey := existing.SecretKey
+	if secretKey == "" {
+		secretKey = "AWS_SECRET_ACCESS_KEY"
+	}
+	secure := true
+	if existing.Secure != nil {
+		secure = *existing.Secure
+	}
+	region := object.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	envs := []corev1.EnvVar{
+		{Name: "GITEA__STORAGE__STORAGE_TYPE", Value: "minio"},
+		{Name: "GITEA__STORAGE__MINIO_ENDPOINT", Value: object.Endpoint},
+		{Name: "GITEA__STORAGE__MINIO_LOCATION", Value: region},
+		{Name: "GITEA__STORAGE__MINIO_USE_SSL", Value: strconv.FormatBool(secure)},
+		{
+			Name: "GITEA__STORAGE__MINIO_ACCESS_KEY_ID",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: existing.CredentialsSecretRef,
+				Key:                  accessKey,
+			}},
+		},
+		{
+			Name: "GITEA__STORAGE__MINIO_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: existing.CredentialsSecretRef,
+				Key:                  secretKey,
+			}},
+		},
+	}
+	if existing.BucketSecretRef != nil {
+		envs = append(envs, corev1.EnvVar{
+			Name:      "GITEA__STORAGE__MINIO_BUCKET",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: existing.BucketSecretRef},
+		})
+	} else {
+		envs = append(envs, corev1.EnvVar{Name: "GITEA__STORAGE__MINIO_BUCKET", Value: existing.Bucket})
+	}
+	return envs
+}
+
+func sessionSvc(gitea *hyperv1.Gitea, password string) string {
+	session := "PROVIDER=db"
+	if gitea.Spec.Valkey {
+		session = `PROVIDER=redis
+PROVIDER_CONFIG=redis+cluster://:` + password + "@" + gitea.Name + "-valkey." + gitea.Namespace + ".svc:6379/0?pool_size=100&idle_timeout=180s&"
+		if gitea.Spec.TLS {
+			session = `PROVIDER=redis
+PROVIDER_CONFIG=rediss+cluster://:` + password + "@" + gitea.Name + "-valkey." + gitea.Namespace + ".svc:6379/0?pool_size=100&idle_timeout=180s&skipverify=true"
+		}
+	}
+	return session
+}
+
+func queueSvc(gitea *hyperv1.Gitea, password string) string {
+	queue := "TYPE=level"
+	if gitea.Spec.Valkey {
+		queue = `TYPE=redis
+CONN_STR=redis+cluster://:` + password + "@" + gitea.Name + "-valkey." + gitea.Namespace + ".svc:6379/0?pool_size=100&idle_timeout=180s&"
+		if gitea.Spec.TLS {
+			queue = `TYPE=redis
+CONN_STR=rediss+cluster://:` + password + "@" + gitea.Name + "-valkey." + gitea.Namespace + ".svc:6379/0?pool_size=100&idle_timeout=180s&skipverify=true"
+		}
+	}
+	return queue
+}
+
+func metricsSvc(gitea *hyperv1.Gitea) string {
+	metrics := "ENABLED=false"
+	if gitea.Spec.Prometheus {
+		metrics = `ENABLED=true
+ENABLED_ISSUE_BY_REPOSITORY=true
+ENABLED_ISSUE_BY_LABEL=false`
+	}
+	return metrics
+}
+
+func (r *GiteaReconciler) getValkeyPassword(ctx context.Context, gitea *hyperv1.Gitea) (string, error) {
+	if !gitea.Spec.Valkey {
+		return "", nil
+	}
+	vk := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-valkey",
+			Namespace: gitea.Namespace,
+		},
+	}
+	if err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-valkey", Namespace: gitea.Namespace}, vk); err != nil {
+		return "", err
+	}
+	_, ok := vk.Data[PASSWORD]
+	if !ok {
+		return "", fmt.Errorf("password not found")
+	}
+	return string(vk.Data[PASSWORD]), nil
+}
+
+func (r *GiteaReconciler) getCertManagerIp(ctx context.Context) (string, error) {
+	logger := log.FromContext(ctx)
+	pods := &corev1.PodList{}
+	l := map[string]string{
+		"app.kubernetes.io/component": "controller",
+	}
+	if err := r.List(ctx, pods, client.InNamespace("cert-manager"), client.MatchingLabels(l)); err != nil {
+		logger.Error(err, "failed to list coredns pods")
+		return "", err
+	}
+	for _, pod := range pods.Items {
+		return pod.Status.PodIP, nil
+	}
+	return "", nil
+}
+
+func (r *GiteaReconciler) detectClusterDomain(ctx context.Context, gitea *hyperv1.Gitea) (string, error) {
+	logger := log.FromContext(ctx)
+
+	logger.Info("detecting cluster domain")
+	clusterDomain := os.Getenv("CLUSTER_DOMAIN")
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
+	ip, err := r.getCertManagerIp(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	if ip != "" {
+		addrs, err := net.LookupAddr(ip)
+		if err != nil {
+			logger.Error(err, "failed to lookup addr", "ip", ip)
+		} else {
+			logger.Info("detected addrs", "addrs", addrs)
+			clusterDomain = addrs[0]
+			clusterDomain = clusterDomain[strings.Index(clusterDomain, ".svc.")+5:]
+			clusterDomain = strings.TrimSuffix(clusterDomain, ".")
+			logger.Info("detected cluster domain", "clusterDomain", clusterDomain)
+		}
+	}
+	gitea.Spec.ClusterDomain = clusterDomain
+	if err := r.Update(ctx, gitea); err != nil {
+		logger.Error(err, "failed to update gitea")
+		return "", err
+	}
+	return clusterDomain, nil
+}
+
+func (r *GiteaReconciler) getCACertificate(ctx context.Context, gitea *hyperv1.Gitea) ([]byte, error) {
+	logger := log.FromContext(ctx)
+
+	cert := &certv1.Certificate{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: gitea.Namespace, Name: gitea.Name}, cert); err != nil {
+		logger.Error(err, "failed to get ca certificate")
+		return []byte{}, err
+	}
+	if cert.Status.Conditions == nil {
+		return []byte{}, nil
+	}
+	good := false
+	for _, cond := range cert.Status.Conditions {
+		if cond.Type == certv1.CertificateConditionReady {
+			if cond.Status == cmetav1.ConditionTrue {
+				good = true
+				break
+			}
+		}
+	}
+	if !good {
+		return []byte{}, nil
+	}
+	tls := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: gitea.Namespace, Name: cert.Spec.SecretName}, tls)
+	if err != nil {
+		logger.Error(err, "failed to get tls secret")
+		return []byte{}, err
+	}
+	return tls.Data["ca.crt"], nil
+}
+
+func (r *GiteaReconciler) upsertCertificate(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+
+	logger.Info("upserting certificate")
+
+	clusterDomain, err := r.detectClusterDomain(ctx, gitea)
+	if err != nil {
+		logger.Error(err, "failed to detect cluster domain")
+		return err
+	}
+	logger.Info("using cluster domain " + clusterDomain)
+	cert := &certv1.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name,
+			Namespace: gitea.Namespace,
+			Labels:    labels(gitea.Name),
+		},
+		Spec: certv1.CertificateSpec{
+			CommonName: gitea.Name + "." + gitea.Namespace + ".svc",
+			SecretName: gitea.Name + "-tls",
+			IssuerRef: cmetav1.IssuerReference{
+				Name: gitea.Spec.CertIssuer,
+				Kind: gitea.Spec.CertIssuerType,
+			},
+			DNSNames: []string{
+				"localhost",
+				gitea.Name,
+				gitea.Name + "." + gitea.Namespace + ".svc",
+				gitea.Name + "." + gitea.Namespace + ".svc." + clusterDomain,
+			},
+			IPAddresses: []string{
+				"127.0.0.1",
+			},
+		},
+	}
+
+	if err := controllerutil.SetControllerReference(gitea, cert, r.Scheme); err != nil {
+		return err
+	}
+	err = r.Get(ctx, types.NamespacedName{Namespace: gitea.Namespace, Name: gitea.Name}, cert)
+	if err != nil && errors.IsNotFound(err) {
+		if err := r.Create(ctx, cert); err != nil {
+			logger.Error(err, "failed to create certificate")
+			return err
+		}
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"CertificateCreate", "Certificate %s/%s is being created", gitea.Namespace, gitea.Name)
+	} else if err != nil {
+		logger.Error(err, "failed to fetch certificate")
+		return err
+	} else if err == nil && false { // detect changes
+		if err := r.Update(ctx, cert); err != nil {
+			logger.Error(err, "failed to update certificate")
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *GiteaReconciler) upsertGiteaSa(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name,
+			Namespace: gitea.Namespace,
+			Labels:    labels(gitea.Name),
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, sa, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name, Namespace: gitea.Namespace}, sa)
+	if err != nil && errors.IsNotFound(err) {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"ServiceAccountCreate", "ServiceAccount %s is being created", gitea.Name)
+		if err := r.Create(ctx, sa); err != nil {
+			logger.Error(err, "failed to create serviceaccount")
+			return err
+		}
+	} else {
+		return err
+	}
+	return nil
+}
+
+func (r *GiteaReconciler) upsertGiteaRole(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name,
+			Namespace: gitea.Namespace,
+			Labels:    labels(gitea.Name),
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"hyperspike.io"},
+				Resources: []string{"auths"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"hyperspike.io"},
+				Resources: []string{"auths/status"},
+				Verbs:     []string{"get", "update", "patch"},
+			},
+			{
+				APIGroups: []string{"hyperspike.io"},
+				Resources: []string{"auths/finalizers"},
+				Verbs:     []string{"update"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, role, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name, Namespace: gitea.Namespace}, role)
+	if err != nil && errors.IsNotFound(err) {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"RoleCreate", "Role %s is being created", gitea.Name)
+		if err := r.Create(ctx, role); err != nil {
+			logger.Error(err, "failed to create role")
+			return err
+		}
+	} else {
+		return err
+	}
+	return nil
+}
+
+func (r *GiteaReconciler) upsertGiteaRoleBinding(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name,
+			Namespace: gitea.Namespace,
+			Labels:    labels(gitea.Name),
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      gitea.Name,
+				Namespace: gitea.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     gitea.Name,
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, rb, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name, Namespace: gitea.Namespace}, rb)
+	if err != nil && errors.IsNotFound(err) {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"RoleBindingCreate", "RoleBinding %s is being created", gitea.Name)
+		if err := r.Create(ctx, rb); err != nil {
+			logger.Error(err, "failed to create rolebinding")
+			return err
+		}
+	} else {
+		return err
+	}
+	return nil
+}
+
+func (r *GiteaReconciler) upsertServiceMonitor(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+
+	labelSelector := labels(gitea.Name)
+	labelSelector["app.kubernetes.io/component"] = Metrics
+	labelSelector["app.kubernetes.io/app"] = Forgejo
+
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = Metrics
+	for k, v := range gitea.Spec.PrometheusLabels {
+		l[k] = v
+	}
+
+	sm := &monitoringv1.ServiceMonitor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name,
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+		Spec: monitoringv1.ServiceMonitorSpec{
+			Selector: metav1.LabelSelector{
+				MatchLabels: labelSelector,
+			},
+			Endpoints: []monitoringv1.Endpoint{
+				{
+					Port: Metrics,
+				},
+			},
+		},
+	}
+	if gitea.Spec.TLS {
+		scheme := monitoringv1.SchemeHTTPS
+		sm.Spec.Endpoints[0].Scheme = &scheme
+		sm.Spec.Endpoints[0].TLSConfig = &monitoringv1.TLSConfig{
+			SafeTLSConfig: monitoringv1.SafeTLSConfig{
+				InsecureSkipVerify: func(b bool) *bool { return &b }(true),
+			},
+		}
+	}
+	if err := controllerutil.SetControllerReference(gitea, sm, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name, Namespace: gitea.Namespace}, sm)
+	if err != nil && errors.IsNotFound(err) {
+		if err := r.Create(ctx, sm); err != nil {
+			logger.Error(err, "failed to create servicemonitor")
+			return err
+		}
+		r.Recorder.Eventf(gitea, sm, corev1.EventTypeNormal, "Creating",
+			"ServiceMonitorCreate", "ServiceMonitor %s is being created", gitea.Name)
+	} else {
+		return err
+	}
+	return nil
+}
+
+func (r *GiteaReconciler) upsertMetricsService(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = Metrics
+	l["app.kubernetes.io/app"] = Forgejo
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-metrics",
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:      corev1.ServiceTypeClusterIP,
+			ClusterIP: "None",
+			Selector:  labels(gitea.Name),
+			Ports: []corev1.ServicePort{
+				{
+					Name:       Metrics,
+					Port:       80,
+					TargetPort: intstr.FromString("http"),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, svc, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-metrics", Namespace: gitea.Namespace}, svc)
+	if err != nil && errors.IsNotFound(err) {
+		if err := r.Create(ctx, svc); err != nil {
+			logger.Error(err, "failed to create metrics service")
+			return err
+		}
+		r.Recorder.Eventf(gitea, svc, corev1.EventTypeNormal, "Creating",
+			"MetricsServiceCreate", "Metrics Service %s is being created", gitea.Name)
+	} else {
+		return err
+	}
+	return nil
+}
+
+func (r *GiteaReconciler) upsertServiceMonitorPG(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+
+	labelSelector := map[string]string{}
+	labelSelector["app.kubernetes.io/component"] = Metrics
+	labelSelector["app.kubernetes.io/app"] = "postgres"
+
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = Metrics
+	for k, v := range gitea.Spec.PrometheusLabels {
+		l[k] = v
+	}
+
+	sm := &monitoringv1.ServiceMonitor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-db",
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+		Spec: monitoringv1.ServiceMonitorSpec{
+			Selector: metav1.LabelSelector{
+				MatchLabels: labelSelector,
+			},
+			Endpoints: []monitoringv1.Endpoint{
+				{
+					Port: Metrics,
+				},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, sm, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-db", Namespace: gitea.Namespace}, sm)
+	if err != nil && errors.IsNotFound(err) {
+		if err := r.Create(ctx, sm); err != nil {
+			logger.Error(err, "failed to create servicemonitor")
+			return err
+		}
+		r.Recorder.Eventf(gitea, sm, corev1.EventTypeNormal, "Creating",
+			"ServiceMonitorCreate", "ServiceMonitor %s is being created", gitea.Name+"-db")
+	} else {
+		return err
+	}
+	return nil
+}
+
+func (r *GiteaReconciler) upsertMetricsServicePG(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+
+	l := labels(gitea.Name)
+	l["app.kubernetes.io/component"] = Metrics
+	l["app.kubernetes.io/app"] = "postgres"
+
+	dbLabels := map[string]string{
+		"application": "spilo",
+		"team":        gitea.Name,
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-db-metrics",
+			Namespace: gitea.Namespace,
+			Labels:    l,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:      corev1.ServiceTypeClusterIP,
+			ClusterIP: "None",
+			Selector:  dbLabels,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       Metrics,
+					Port:       80,
+					TargetPort: intstr.FromString("metrics"),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, svc, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-db-metrics", Namespace: gitea.Namespace}, svc)
+	if err != nil && errors.IsNotFound(err) {
+		if err := r.Create(ctx, svc); err != nil {
+			logger.Error(err, "failed to create metrics service")
+			return err
+		}
+		r.Recorder.Eventf(gitea, svc, corev1.EventTypeNormal, "Creating",
+			"MetricsServiceCreate", "Metrics Service %s is being created", gitea.Name+"-db-metrics")
+	} else {
+		return err
+	}
+	return nil
+}
+
+func matchSecrets(base, match corev1.Secret) bool {
+	for k, v := range base.Data {
+		val, ok := match.Data[k]
+		if !ok {
+			return false
+		}
+		if !bytes.Equal(val, v) {
+			return false
+		}
+	}
+	for k, v := range match.Data {
+		val, ok := base.Data[k]
+		if !ok {
+			return false
+		}
+		if !bytes.Equal(val, v) {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *GiteaReconciler) upsertObject(ctx context.Context, gitea *hyperv1.Gitea) (string, string, error) {
+	logger := log.FromContext(ctx)
+
+	endPoint := gitea.Spec.ObjectStorage.Endpoint
+	if endPoint == "" && gitea.Spec.ObjectStorage.Type == GCS {
+		endPoint = "storage.googleapis.com"
+	}
+	region := gitea.Spec.ObjectStorage.Region
+	if region == "" && gitea.Spec.ObjectStorage.Type == GCS {
+		region = "auto"
+	}
+	if region == "" && gitea.Spec.ObjectStorage.Type == S3 {
+		if os.Getenv("AWS_REGION") != "" {
+			region = os.Getenv("AWS_REGION")
+		} else {
+			region = "us-east-1"
+		}
+	}
+
+	objClient, err := hclient.NewObjectClient(ctx, &hclient.ObjectOpts{
+		Endpoint:      endPoint,
+		CloudProvider: gitea.Spec.ObjectStorage.Type,
+		Region:        region,
+	})
+	if err != nil {
+		logger.Error(err, "failed to create object client")
+		return "", "", err
+	}
+	buckets, err := objClient.ListBuckets()
+	if err != nil {
+		logger.Error(err, "failed to list buckets")
+		return "", "", err
+	}
+	//bucketName := "gitea-operator-" + gitea.Name + "-" + gitea.Namespace + "-" + strings.Replace(gitea.Spec.Ingress.Host, ".", "_", -1)
+	bucketName := "gitea-operator-" + gitea.Name + "-" + gitea.Namespace + "-" + gitea.Spec.Ingress.Host
+	found := false
+	for _, bucket := range buckets {
+		if bucket == bucketName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		if err := objClient.CreateBucket(bucketName); err != nil {
+			logger.Error(err, "failed to create bucket")
+			return "", "", err
+		}
+	}
+	access, secret, err := r.getObjectStorage(ctx, gitea)
+	if err == nil && access != "" && secret != "" {
+		return access, secret, nil
+	}
+
+	logger.Info("creating object storage")
+
+	access, secret, err = objClient.Credentials("gitea-operator-"+gitea.Name+"-"+gitea.Namespace, bucketName)
+	if err != nil {
+		logger.Error(err, "failed to get credentials")
+		return "", "", err
+	}
+
+	if err := r.upsertSecret(ctx, gitea, gitea.Name+"-object", map[string]string{
+		"access": access,
+		"secret": secret,
+	}, false); err != nil {
+		logger.Error(err, "failed to upsert secret object")
+		return "", "", err
+	}
+	if gitea.Spec.DeletionPolicy == hyperv1.DeletionPolicyDelete && !controllerutil.ContainsFinalizer(gitea, objectFinalizer) {
+		controllerutil.AddFinalizer(gitea, objectFinalizer)
+		if err := r.Update(ctx, gitea); err != nil {
+			logger.Error(err, "failed to add finalizers")
+			return access, secret, err
+		}
+	}
+
+	return access, secret, nil
+}
+
+func (r *GiteaReconciler) deleteObject(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+
+	//bucketName := "gitea-operator-" + gitea.Name + "-" + gitea.Namespace + "-" + strings.Replace(gitea.Spec.Ingress.Host, ".", "_", -1)
+	bucketName := "gitea-operator-" + gitea.Name + "-" + gitea.Namespace + "-" + gitea.Spec.Ingress.Host
+	userName := "gitea-operator-" + gitea.Name + "-" + gitea.Namespace
+
+	objClient, err := hclient.NewObjectClient(ctx, &hclient.ObjectOpts{
+		Endpoint:      gitea.Spec.ObjectStorage.Endpoint,
+		CloudProvider: gitea.Spec.ObjectStorage.Type,
+	})
+	if err != nil {
+		logger.Error(err, "failed to create object client")
+		return err
+	}
+	if err := objClient.DeleteUser(userName); err != nil {
+		logger.Error(err, "failed to delete user", "user", userName)
+		return err
+	}
+	if err := objClient.DeleteBucket(bucketName); err != nil {
+		logger.Error(err, "failed to delete bucket", "bucket", bucketName)
+		return err
+	}
+
+	return nil
+}
+
+func (r *GiteaReconciler) upsertSecret(ctx context.Context, gitea *hyperv1.Gitea, name string, strData map[string]string, once bool) error {
+	logger := log.FromContext(ctx)
+	data := map[string][]byte{}
+	for k, v := range strData {
+		data[k] = []byte(v)
+	}
+	secret := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: gitea.Namespace,
+			Labels:    labels(gitea.Name),
+		},
+		Data: data,
+		Type: "Opaque",
+	}
+	fetched := secret
+	if err := controllerutil.SetControllerReference(gitea, &secret, r.Scheme); err != nil {
+		return err
+	}
+	if err := controllerutil.SetControllerReference(gitea, &fetched, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: gitea.Namespace}, &fetched)
+	if err != nil && errors.IsNotFound(err) {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"SecretCreate", "Secret %s is being created", name)
+		if err := r.Create(ctx, &secret); err != nil {
+			logger.Error(err, "failed to create secret")
+			return err
+		}
+	} else if err == nil && !once {
+		if !matchSecrets(fetched, secret) {
+			logger.Info("secrets unmatched, updating and restarting")
+			r.Recorder.Eventf(gitea, &fetched, corev1.EventTypeNormal, "Updating",
+				"SecretUpdate", "Secret %s is being updated", name)
+			if err := r.Update(ctx, &secret); err != nil {
+				logger.Error(err, "failed to update secret")
+				return err
+			}
+			if err := r.restart(ctx, gitea); err != nil {
+				logger.Error(err, "failed to restart")
+			}
+		}
+	} else {
+		return err
+	}
+	return nil
+}
+
+func ptrInt(num int) *int64 {
+	num64 := int64(num)
+	return &num64
+}
+func ptrInt32(num int) *int32 {
+	num32 := int32(num) // #nosec G115
+	return &num32
+}
+
+func ptrBool(bol bool) *bool {
+	return &bol
+}
+
+func ptrString(str string) *string {
+	return &str
+}
+
+func envUpsert(envs []corev1.EnvVar, env corev1.EnvVar) []corev1.EnvVar {
+	for i, e := range envs {
+		if e.Name == env.Name {
+			envs[i] = env
+			return envs
+		}
+	}
+	return append(envs, env)
+}
+
+func instanceEnv(gitea *hyperv1.Gitea, in map[string]string) []corev1.EnvVar {
+	dataMount := gitea.Spec.Persistence.Data.MountPath
+	if dataMount == "" {
+		dataMount = "/data"
+	}
+	appINIPath := gitea.Spec.Workload.AppINIPath
+	if appINIPath == "" {
+		appINIPath = "/data/gitea/conf/app.ini"
+	}
+	cpy := map[string]string{
+		"GITEA_APP_INI":  appINIPath,
+		"GITEA_CUSTOM":   path.Dir(path.Dir(appINIPath)),
+		"GITEA_WORK_DIR": dataMount,
+		"GITEA_TEMP":     "/tmp/gitea",
+	}
+	var ret = []corev1.EnvVar{}
+	for k, v := range cpy {
+		ret = envUpsert(ret, corev1.EnvVar{Name: k, Value: v})
+	}
+	for k, v := range in {
+		ret = envUpsert(ret, corev1.EnvVar{Name: k, Value: v})
+	}
+	return ret
+}
+
+func mergeEnv(base, overrides []corev1.EnvVar) []corev1.EnvVar {
+	for _, env := range overrides {
+		base = envUpsert(base, env)
+	}
+	return base
+}
+
+func image(gitea *hyperv1.Gitea) string {
+	if gitea.Spec.Image == "" {
+		return "codeberg.org/forgejo/forgejo:16.0.2-rootless"
+	}
+	return gitea.Spec.Image
+}
+
+func imageSpoon(gitea *hyperv1.Gitea) string {
+	if gitea.Spec.Workload.SpoonImage != "" {
+		return gitea.Spec.Workload.SpoonImage
+	}
+	return "ghcr.io/hyperspike/gitea-spoon:v0.0.5"
+}
+
+func spoonEnabled(gitea *hyperv1.Gitea) bool {
+	return gitea.Spec.Workload.SpoonEnabled != nil && *gitea.Spec.Workload.SpoonEnabled
+}
+
+func volUpsert(vols []corev1.VolumeMount, vol corev1.VolumeMount) []corev1.VolumeMount {
+	for i, v := range vols {
+		if v.Name == vol.Name {
+			vols[i] = vol
+			return vols
+		}
+	}
+	return append(vols, vol)
+}
+
+func instanceVolumes(gitea *hyperv1.Gitea, in map[string]string) []corev1.VolumeMount {
+	dataMount := gitea.Spec.Persistence.Data.MountPath
+	if dataMount == "" {
+		dataMount = "/data"
+	}
+	cpy := map[string]string{
+		"temp": "/tmp",
+		"data": dataMount,
+	}
+	if config := gitea.Spec.Persistence.Config; config != nil && config.ExistingClaim != "" {
+		mountPath := config.MountPath
+		if mountPath == "" {
+			mountPath = "/var/lib/gitea"
+		}
+		cpy["instance-config"] = mountPath
+	}
+	var ret = []corev1.VolumeMount{}
+	for k, v := range cpy {
+		ret = volUpsert(ret, corev1.VolumeMount{Name: k, MountPath: v})
+	}
+	for k, v := range in {
+		ret = volUpsert(ret, corev1.VolumeMount{Name: k, MountPath: v})
+	}
+
+	return ret
+}
+
+//nolint:unparam
+func (r *GiteaReconciler) restart(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	pods := &corev1.PodList{}
+	err := r.List(ctx, pods, client.InNamespace(gitea.Namespace))
+	if err != nil {
+		logger.Error(err, "failed to fetch pods")
+		return nil
+	}
+	for _, pod := range pods.Items {
+		if pod.Labels["app.kubernetes.io/name"] != Forgejo {
+			continue
+		}
+		if pod.Labels["app.kubernetes.io/component"] == "deployment" && pod.Labels["app.kubernetes.io/instance"] == gitea.Name {
+			r.Recorder.Eventf(gitea, &pod, corev1.EventTypeNormal, "Restarting",
+				"PodRestart", "Secret update requires restart of pod %s", pod.Name)
+			if err := r.Delete(ctx, &pod); err != nil {
+				logger.Error(err, "failed deleting pod")
+			}
+		}
+	}
+	return nil
+}
+func (r *GiteaReconciler) podUP(ctx context.Context, gitea *hyperv1.Gitea) (bool, error) {
+	logger := log.FromContext(ctx)
+	pods := &corev1.PodList{}
+	err := r.List(ctx, pods, client.InNamespace(gitea.Namespace))
+	if err != nil {
+		logger.Error(err, "failed to fetch pods")
+		return false, err
+	}
+	for _, pod := range pods.Items {
+		if pod.Labels["app.kubernetes.io/name"] != Forgejo {
+			continue
+		}
+		if pod.Labels["app.kubernetes.io/component"] == "deployment" && pod.Labels["app.kubernetes.io/instance"] == gitea.Name {
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == "Ready" && cond.Status == "True" {
+					if err := r.setCondition(ctx, gitea, "InstanceReady", "True", "InstanceReady", "Pod Up"); err != nil {
+						return true, err
+					}
+					return true, nil
+				}
+			}
+		}
+	}
+	if err := r.setCondition(ctx, gitea, "InstanceReady", "False", "InstanceReady", "Pod Down"); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (r *GiteaReconciler) httpClient(ctx context.Context, gitea *hyperv1.Gitea) (*http.Client, error) {
+	logger := log.FromContext(ctx)
+	httpClient := http.Client{
+		Timeout: time.Second * 10,
+	}
+	if gitea.Spec.TLS || gitea.Spec.Connection.CABundleSecretRef != nil {
+		certpool, _ := x509.SystemCertPool()
+		if certpool == nil {
+			logger.Info("system cert pool is nil, creating new")
+			certpool = x509.NewCertPool()
+		}
+		var cert []byte
+		if ref := gitea.Spec.Connection.CABundleSecretRef; ref != nil {
+			secret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: gitea.Namespace}, secret); err != nil {
+				return nil, err
+			}
+			cert = secret.Data[ref.Key]
+			if len(cert) == 0 {
+				return nil, fmt.Errorf("CA bundle secret %s/%s key %q is empty", gitea.Namespace, ref.Name, ref.Key)
+			}
+		} else {
+			var err error
+			cert, err = r.getCACertificate(ctx, gitea)
+			if err != nil {
+				logger.Error(err, "failed to get ca certificate")
+				return nil, err
+			}
+		}
+		if !certpool.AppendCertsFromPEM(cert) {
+			return nil, fmt.Errorf("configured CA bundle does not contain a valid PEM certificate")
+		}
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				RootCAs:    certpool,
+			},
+		}
+	}
+	return &httpClient, nil
+}
+
+func (r *GiteaReconciler) apiUP(ctx context.Context, gitea *hyperv1.Gitea) bool {
+	logger := log.FromContext(ctx)
+	httpClient, err := r.httpClient(ctx, gitea)
+	if err != nil {
+		logger.Error(err, "failed to get http client")
+		return false
+	}
+	url, err := hclient.Endpoint(gitea)
+	if err != nil {
+		logger.Error(err, "failed to resolve instance endpoint")
+		return false
+	}
+	response, err := httpClient.Get(url)
+	if err != nil {
+		logger.Error(err, "failed to get url "+url)
+		if err := r.setInstanceStatus(ctx, gitea, false, "APIDown", "Forgejo API is not reachable", url); err != nil {
+			logger.Error(err, "Gitea status update failed.")
+			return false
+		}
+		return false
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusBadRequest {
+		logger.Info("Forgejo API returned an unhealthy status", "url", url, "status", response.StatusCode)
+		return false
+	}
+
+	return true
+}
+
+func (r *GiteaReconciler) adminToken(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	logger.Info("checking for admin token", "Secret", gitea.Name+"-admin")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name + "-admin",
+			Namespace: gitea.Namespace,
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, secret, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.Get(ctx, types.NamespacedName{Name: gitea.Name + "-admin", Namespace: gitea.Namespace}, secret); err != nil {
+		logger.Error(err, "failed getting admin secret "+gitea.Name+"-admin ")
+		return err
+	}
+	tok, ok := secret.Data["token"]
+	if ok && len(tok) != 0 && string(tok) != "" {
+		logger.Info("token detected, skipping", "Secret", gitea.Name+"-admin")
+		return nil
+	}
+	logger.Info("creating admin token", "SecretName", gitea.Name+"-admin")
+	body := []byte(`{"name":"admin","scopes": ["write:admin","write:organization","write:repository","write:user"]}`)
+	endpoint, err := hclient.Endpoint(gitea)
+	if err != nil {
+		return err
+	}
+	url := strings.TrimRight(endpoint, "/") + "/api/v1/users/gitea/tokens"
+	httpClient, err := r.httpClient(ctx, gitea)
+	if err != nil {
+		logger.Error(err, "failed to get http client")
+		return err
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	if err != nil {
+		logger.Error(err, "failed creating new http request")
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	auth := base64.StdEncoding.EncodeToString([]byte(string(secret.Data[USERNAME]) + ":" + string(secret.Data[PASSWORD])))
+	req.Header.Set("Authorization", "Basic "+auth)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		logger.Error(err, "failed posting to url "+url)
+		return err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Info("failed to close token body")
+		}
+	}()
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error(err, "failed reading body from url "+url)
+		return err
+	}
+	var tresp tokenResponse
+	err = json.Unmarshal(body, &tresp)
+	if err != nil {
+		logger.Error(err, "failed json unmarshal "+url)
+		return err
+	}
+	if tresp.Token == "" {
+		logger.Error(err, "token not found in response", "response", string(body))
+		return fmt.Errorf("token not found in response")
+	}
+	secret.Data["token"] = []byte(tresp.Token)
+	if err := r.Update(ctx, secret); err != nil {
+		logger.Error(err, "failed to update secret "+gitea.Name+"-admin."+gitea.Namespace)
+		return err
+	}
+	r.Recorder.Eventf(gitea, secret, corev1.EventTypeNormal, "Creating",
+		"AdminTokenCreate", "Admin token created and added to %s secret", gitea.Name+"-admin")
+	if err := r.setCondition(ctx, gitea, "ApiToken", "True", "ApiToken", "Api Token Provisioned"); err != nil {
+		logger.Error(err, "Gitea status update failed.")
+		return err
+	}
+
+	return nil
+}
+
+type tokenResponse struct {
+	Id     int      `json:"id"`
+	Name   string   `json:"name"`
+	Scopes []string `json:"scopes"`
+	Token  string   `json:"sha1"`
+}
+
+func (r *GiteaReconciler) upsertPDB(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gitea.Name,
+			Namespace: gitea.Namespace,
+			Labels:    labels(gitea.Name),
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels(gitea.Name),
+			},
+			MaxUnavailable: func(i int32) *intstr.IntOrString {
+				return &intstr.IntOrString{IntVal: i}
+			}(1),
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, pdb, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name, Namespace: gitea.Namespace}, pdb)
+	if err != nil && errors.IsNotFound(err) {
+		r.Recorder.Eventf(gitea, nil, corev1.EventTypeNormal, "Creating",
+			"PDBCreate", "PDB %s is being created", gitea.Name)
+		if err := r.Create(ctx, pdb); err != nil {
+			logger.Error(err, "failed to create pdb")
+			return err
+		}
+	} else {
+		return err
+	}
+	return nil
+}
+
+func (r *GiteaReconciler) upsertGiteaSts(ctx context.Context, gitea *hyperv1.Gitea) error {
+	logger := log.FromContext(ctx)
+	name := workloadName(gitea)
+	disk := resource.NewQuantity(50*1024*1024*1024, resource.BinarySI)
+	scheme := corev1.URISchemeHTTP
+	if gitea.Spec.TLS {
+		scheme = corev1.URISchemeHTTPS
+	}
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: gitea.Namespace,
+			Labels:    labels(gitea.Name),
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels(gitea.Name),
+			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "data",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{"ReadWriteOnce"},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								"storage": *disk,
+							},
+						},
+					},
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels(gitea.Name),
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: gitea.Name,
+					/*
+						SecurityContext: &corev1.PodSecurityContext{
+							RunAsUser:    ptrInt(1000),
+							RunAsGroup:   ptrInt(1000),
+							FSGroup:      ptrInt(1000),
+							RunAsNonRoot: ptrBool(true),
+						}, */
+					InitContainers: []corev1.Container{
+						{
+							Name:         "init-directories",
+							Env:          instanceEnv(gitea, nil),
+							Image:        image(gitea),
+							VolumeMounts: instanceVolumes(gitea, map[string]string{"init": "/usr/sbin"}),
+							Command: []string{
+								"/usr/sbin/init_directory_structure.sh",
+							},
+						},
+						{
+							Name:         "init-app-ini",
+							Env:          instanceEnv(gitea, nil),
+							Image:        image(gitea),
+							VolumeMounts: instanceVolumes(gitea, map[string]string{"config": "/usr/sbin", "inline-config-sources": "/env-to-ini-mounts/inlines/"}),
+							Command: []string{
+								"/usr/sbin/config_environment.sh",
+							},
+						},
+						{
+							Name:         "configure-gitea",
+							Env:          instanceEnv(gitea, map[string]string{"HOME": dataMountPath(gitea) + "/git"}),
+							Image:        image(gitea),
+							VolumeMounts: instanceVolumes(gitea, map[string]string{"init": "/usr/sbin"}),
+							Command: []string{
+								"/usr/sbin/configure_gitea.sh",
+							},
+							SecurityContext: &corev1.SecurityContext{
+								RunAsUser: ptrInt(1000),
+							},
+						},
+					},
+					Containers: []corev1.Container{
+						{
+							Name:         Forgejo,
+							Env:          instanceEnv(gitea, map[string]string{"SSH_LISTEN_PORT": "2222", "SSH_PORT": "22", "HOME": dataMountPath(gitea) + "/git", "TMPDIR": "/tmp/gitea"}),
+							Image:        image(gitea),
+							VolumeMounts: instanceVolumes(gitea, nil),
+							Ports: []corev1.ContainerPort{
+								{
+									Name:          "http",
+									ContainerPort: 3000,
+								},
+								{
+									Name:          "ssh",
+									ContainerPort: 2222,
+								},
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path:   "/api/healthz",
+										Port:   intstr.FromString("http"),
+										Scheme: scheme,
+									},
+								},
+								FailureThreshold:    3,
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+								SuccessThreshold:    1,
+								TimeoutSeconds:      1,
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Capabilities: &corev1.Capabilities{
+									Add: []corev1.Capability{
+										"SYS_CHROOT",
+									},
+								},
+							},
+						},
+						{
+							Name:         "gitea-spoon",
+							Image:        imageSpoon(gitea),
+							Env:          instanceEnv(gitea, map[string]string{"HOME": dataMountPath(gitea) + "/git", "TMPDIR": "/tmp/gitea"}),
+							VolumeMounts: instanceVolumes(gitea, nil),
+							Command: []string{
+								"/manager",
+							},
+							Args: []string{
+								"--metrics-bind-address=:8443",
+								"--health-probe-bind-address=:8081",
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/healthz",
+										Port: intstr.FromInt(8081),
+									},
+								},
+								InitialDelaySeconds: 8,
+								PeriodSeconds:       5,
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/readyz",
+										Port: intstr.FromInt(8081),
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       5,
+							},
+							SecurityContext: &corev1.SecurityContext{
+								RunAsUser:                ptrInt(1000),
+								AllowPrivilegeEscalation: ptrBool(false),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{
+										"ALL",
+									},
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "init",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName:  gitea.Name + "-init",
+									DefaultMode: ptrInt32(110),
+								},
+							},
+						},
+						{
+							Name: "config",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName:  gitea.Name + "-config",
+									DefaultMode: ptrInt32(110),
+								},
+							},
+						},
+						{
+							Name: "inline-config-sources",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: gitea.Name + "-inline-config",
+								},
+							},
+						},
+						{
+							Name: "temp",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{
+									Medium: "",
+								},
+							},
+						},
+					},
+				},
+			},
+			ServiceName: managedServiceName(gitea),
+		},
+	}
+	if !spoonEnabled(gitea) {
+		sts.Spec.Template.Spec.Containers = sts.Spec.Template.Spec.Containers[:1]
+	}
+	if gitea.Spec.Rootless {
+		changePolicy := corev1.FSGroupChangeOnRootMismatch
+		sts.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+			RunAsUser:           ptrInt(1000),
+			RunAsGroup:          ptrInt(1000),
+			RunAsNonRoot:        ptrBool(true),
+			FSGroup:             ptrInt(1000),
+			FSGroupChangePolicy: &changePolicy,
+		}
+		rootlessContext := &corev1.SecurityContext{
+			RunAsUser:                ptrInt(1000),
+			RunAsGroup:               ptrInt(1000),
+			RunAsNonRoot:             ptrBool(true),
+			AllowPrivilegeEscalation: ptrBool(false),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		}
+		for index := range sts.Spec.Template.Spec.InitContainers {
+			sts.Spec.Template.Spec.InitContainers[index].SecurityContext = rootlessContext.DeepCopy()
+		}
+		sts.Spec.Template.Spec.Containers[0].SecurityContext = rootlessContext.DeepCopy()
+	}
+	if gitea.Spec.Workload.Replicas != nil {
+		sts.Spec.Replicas = gitea.Spec.Workload.Replicas
+	}
+	sts.Spec.Template.Spec.Tolerations = gitea.Spec.Workload.Tolerations
+	sts.Spec.Template.Spec.Affinity = gitea.Spec.Workload.Affinity
+	whenDeleted := appsv1.RetainPersistentVolumeClaimRetentionPolicyType
+	if gitea.Spec.DeletionPolicy == hyperv1.DeletionPolicyDelete {
+		whenDeleted = appsv1.DeletePersistentVolumeClaimRetentionPolicyType
+	}
+	sts.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+		WhenDeleted: whenDeleted,
+		WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+	}
+
+	dataVolume := gitea.Spec.Persistence.Data
+	if dataVolume.ExistingClaim != "" {
+		sts.Spec.VolumeClaimTemplates = nil
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: "data",
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: dataVolume.ExistingClaim,
+			}},
+		})
+	} else {
+		if dataVolume.Size != "" {
+			quantity, err := resource.ParseQuantity(dataVolume.Size)
+			if err != nil {
+				return fmt.Errorf("invalid persistence.data.size %q: %w", dataVolume.Size, err)
+			}
+			sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage] = quantity
+		}
+		if dataVolume.StorageClass != "" {
+			sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = ptrString(dataVolume.StorageClass)
+		}
+	}
+	if configVolume := gitea.Spec.Persistence.Config; configVolume != nil && configVolume.ExistingClaim != "" {
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: "instance-config",
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: configVolume.ExistingClaim,
+			}},
+		})
+	}
+	admins := []corev1.EnvVar{
+		{Name: "FORGEJO_BOOTSTRAP_ADMIN", Value: strconv.FormatBool(bootstrapAdmin(gitea))},
+	}
+	if bootstrapAdmin(gitea) {
+		admins = append(admins,
+			corev1.EnvVar{
+				Name: "GITEA_ADMIN_USERNAME",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: gitea.Name + "-admin",
+						},
+						Key: USERNAME,
+					},
+				},
+			},
+			corev1.EnvVar{
+				Name: "GITEA_ADMIN_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: gitea.Name + "-admin",
+						},
+						Key: PASSWORD,
+					},
+				},
+			},
+		)
+	}
+	sts.Spec.Template.Spec.InitContainers[2].Env = append(sts.Spec.Template.Spec.InitContainers[2].Env, admins...)
+	if gitea.Spec.TLS {
+		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: TLS,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: gitea.Name + "-tls",
+				},
+			},
+		})
+		sts.Spec.Template.Spec.Containers[0].VolumeMounts = append(sts.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+			Name:      TLS,
+			MountPath: _CERTS,
+		})
+		sts.Spec.Template.Spec.InitContainers[0].VolumeMounts = append(sts.Spec.Template.Spec.InitContainers[0].VolumeMounts, corev1.VolumeMount{
+			Name:      TLS,
+			MountPath: _CERTS,
+		})
+		sts.Spec.Template.Spec.InitContainers[1].VolumeMounts = append(sts.Spec.Template.Spec.InitContainers[1].VolumeMounts, corev1.VolumeMount{
+			Name:      TLS,
+			MountPath: _CERTS,
+		})
+		sts.Spec.Template.Spec.InitContainers[2].VolumeMounts = append(sts.Spec.Template.Spec.InitContainers[2].VolumeMounts, corev1.VolumeMount{
+			Name:      TLS,
+			MountPath: _CERTS,
+		})
+	}
+
+	var dbs []corev1.EnvVar
+	if existing := gitea.Spec.Postgres.Existing; existing != nil {
+		databaseName, err := r.existingDatabaseName(ctx, gitea)
+		if err != nil {
+			return err
+		}
+		port := existing.Port
+		if port == 0 {
+			port = 5432
+		}
+		sslMode := existing.SSLMode
+		if sslMode == "" {
+			sslMode = "require"
+		}
+		usernameKey := existing.UsernameKey
+		if usernameKey == "" {
+			usernameKey = USERNAME
+		}
+		passwordKey := existing.PasswordKey
+		if passwordKey == "" {
+			passwordKey = PASSWORD
+		}
+		dbs = []corev1.EnvVar{
+			{Name: "GITEA__DATABASE__DB_TYPE", Value: "postgres"},
+			{Name: "GITEA__DATABASE__HOST", Value: net.JoinHostPort(existing.Host, fmt.Sprintf("%d", port))},
+			{Name: "GITEA__DATABASE__NAME", Value: databaseName},
+			{
+				Name: "GITEA__DATABASE__USER",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: existing.CredentialsSecretRef,
+					Key:                  usernameKey,
+				}},
+			},
+			{
+				Name: "GITEA__DATABASE__PASSWD",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: existing.CredentialsSecretRef,
+					Key:                  passwordKey,
+				}},
+			},
+			{Name: "GITEA__DATABASE__SSL_MODE", Value: sslMode},
+		}
+	} else if gitea.Spec.Postgres.Provider == Cnpg {
+		dbs = []corev1.EnvVar{
+			{
+				Name:  "GITEA__DATABASE__DB_TYPE",
+				Value: "postgres",
+			},
+			{
+				Name:  "GITEA__DATABASE__HOST",
+				Value: gitea.Name + "-db-rw." + gitea.Namespace + ".svc:5432",
+			},
+			{
+				Name:  "GITEA__DATABASE__NAME",
+				Value: gitea.Name,
+			},
+			{
+				Name: "GITEA__DATABASE__USER",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: gitea.Name + "-db-app",
+						},
+						Key: USERNAME,
+					},
+				},
+			},
+			{
+				Name: "GITEA__DATABASE__PASSWD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: gitea.Name + "-db-app",
+						},
+						Key: PASSWORD,
+					},
+				},
+			},
+			{
+				Name:  "GITEA__DATABASE__SSL_MODE",
+				Value: "require",
+			},
+		}
+	} else {
+		dbs = []corev1.EnvVar{
+			{
+				Name:  "GITEA__DATABASE__DB_TYPE",
+				Value: "postgres",
+			},
+			{
+				Name:  "GITEA__DATABASE__HOST",
+				Value: gitea.Name + "-" + gitea.Name + "." + gitea.Namespace + ".svc:5432",
+			},
+			{
+				Name:  "GITEA__DATABASE__NAME",
+				Value: gitea.Name,
+			},
+			{
+				Name: "GITEA__DATABASE__USER",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: gitea.Name + "." + gitea.Name + "-" + gitea.Name + ".credentials.postgresql.acid.zalan.do",
+						},
+						Key: USERNAME,
+					},
+				},
+			},
+			{
+				Name: "GITEA__DATABASE__PASSWD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: gitea.Name + "." + gitea.Name + "-" + gitea.Name + ".credentials.postgresql.acid.zalan.do",
+						},
+						Key: PASSWORD,
+					},
+				},
+			},
+			{
+				Name:  "GITEA__DATABASE__SSL_MODE",
+				Value: "require",
+			},
+		}
+	}
+	sts.Spec.Template.Spec.InitContainers[1].Env = append(sts.Spec.Template.Spec.InitContainers[1].Env, dbs...)
+	sts.Spec.Template.Spec.InitContainers[2].Env = append(sts.Spec.Template.Spec.InitContainers[2].Env, dbs...)
+	for index := range sts.Spec.Template.Spec.Containers {
+		sts.Spec.Template.Spec.Containers[index].Env = append(sts.Spec.Template.Spec.Containers[index].Env, dbs...)
+	}
+	envs := []corev1.EnvVar{
+		{
+			Name:  "GITEA__SERVER__START_SSH_SERVER",
+			Value: strconv.FormatBool(sshEnabled(gitea)),
+		},
+		{
+			Name:  "START_SSH_SERVER",
+			Value: strconv.FormatBool(sshEnabled(gitea)),
+		},
+		{
+			Name:  "SSH_LOG_LEVEL",
+			Value: "INFO",
+		},
+	}
+	sts.Spec.Template.Spec.Containers[0].Env = append(sts.Spec.Template.Spec.Containers[0].Env, envs...)
+	storageEnv := existingObjectStorageEnv(gitea)
+	for index := range sts.Spec.Template.Spec.InitContainers {
+		sts.Spec.Template.Spec.InitContainers[index].Env = mergeEnv(sts.Spec.Template.Spec.InitContainers[index].Env, storageEnv)
+	}
+	sts.Spec.Template.Spec.Containers[0].Env = mergeEnv(sts.Spec.Template.Spec.Containers[0].Env, storageEnv)
+	for index := range sts.Spec.Template.Spec.InitContainers {
+		sts.Spec.Template.Spec.InitContainers[index].Env = mergeEnv(sts.Spec.Template.Spec.InitContainers[index].Env, gitea.Spec.Workload.Env)
+	}
+	sts.Spec.Template.Spec.Containers[0].Env = mergeEnv(sts.Spec.Template.Spec.Containers[0].Env, gitea.Spec.Workload.Env)
+	desired := sts.DeepCopy()
+	current := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: gitea.Namespace}}
+	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, current, func() error {
+		if !current.CreationTimestamp.IsZero() {
+			if !apiequality.Semantic.DeepEqual(current.Spec.Selector, desired.Spec.Selector) {
+				return fmt.Errorf("statefulset %s/%s has an incompatible selector; set spec.workload.name to use a new workload during cutover", current.Namespace, current.Name)
+			}
+			if current.Spec.ServiceName != desired.Spec.ServiceName {
+				return fmt.Errorf("statefulset %s/%s has an incompatible serviceName; set spec.workload.name to use a new workload during cutover", current.Namespace, current.Name)
+			}
+			if !apiequality.Semantic.DeepDerivative(desired.Spec.VolumeClaimTemplates, current.Spec.VolumeClaimTemplates) {
+				return fmt.Errorf("statefulset %s/%s has incompatible volume claim templates; use persistence.data.existingClaim or set spec.workload.name for a new workload", current.Namespace, current.Name)
+			}
+		} else {
+			current.Spec.Selector = desired.Spec.Selector
+			current.Spec.ServiceName = desired.Spec.ServiceName
+			current.Spec.VolumeClaimTemplates = desired.Spec.VolumeClaimTemplates
+		}
+		current.Labels = desired.Labels
+		current.Spec.Replicas = desired.Spec.Replicas
+		current.Spec.Template = desired.Spec.Template
+		current.Spec.UpdateStrategy = desired.Spec.UpdateStrategy
+		current.Spec.PodManagementPolicy = desired.Spec.PodManagementPolicy
+		current.Spec.MinReadySeconds = desired.Spec.MinReadySeconds
+		current.Spec.PersistentVolumeClaimRetentionPolicy = desired.Spec.PersistentVolumeClaimRetentionPolicy
+		return controllerutil.SetControllerReference(gitea, current, r.Scheme)
+	})
+	if err != nil {
+		logger.Error(err, "failed to reconcile statefulset", "statefulset", name)
+		return err
+	}
+	if result == controllerutil.OperationResultCreated {
+		r.Recorder.Eventf(gitea, current, corev1.EventTypeNormal, "Creating",
+			"StatefulSetCreate", "StatefulSet %s was created", name)
+	}
+	return nil
+}
+
+func (r *GiteaReconciler) upsertGiteaIngress(ctx context.Context, gitea *hyperv1.Gitea) error {
+	if gitea.Spec.Ingress.Managed != nil && !*gitea.Spec.Ingress.Managed {
+		return nil
+	}
+	logger := log.FromContext(ctx)
+	hostname := gitea.Spec.Ingress.Host
+	if hostname == "" {
+		hostname = "git.example.com"
+	}
+	annotations := gitea.Spec.Ingress.Annotations
+	if gitea.Spec.TLS {
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations["nginx.ingress.kubernetes.io/backend-protocol"] = "HTTPS"
+	}
+	prefix := netv1.PathTypePrefix
+	ing := &netv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        gitea.Name,
+			Namespace:   gitea.Namespace,
+			Labels:      labels(gitea.Name),
+			Annotations: annotations,
+		},
+		Spec: netv1.IngressSpec{
+			IngressClassName: ptrString("nginx"),
+			Rules: []netv1.IngressRule{
+				{
+					Host: hostname,
+					IngressRuleValue: netv1.IngressRuleValue{
+						HTTP: &netv1.HTTPIngressRuleValue{
+							Paths: []netv1.HTTPIngressPath{
+								{
+									Path:     "/",
+									PathType: &prefix,
+									Backend: netv1.IngressBackend{
+										Service: &netv1.IngressServiceBackend{
+											Name: managedServiceName(gitea),
+											Port: netv1.ServiceBackendPort{
+												Name: "http",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			TLS: []netv1.IngressTLS{
+				{
+					Hosts: []string{
+						hostname,
+					},
+					SecretName: gitea.Name + "-ingress-tls",
+				},
+			},
+		},
+	}
+	if err := controllerutil.SetControllerReference(gitea, ing, r.Scheme); err != nil {
+		return err
+	}
+	err := r.Get(ctx, types.NamespacedName{Name: gitea.Name, Namespace: gitea.Namespace}, ing)
+	if err != nil && errors.IsNotFound(err) {
+		if err := r.Create(ctx, ing); err != nil {
+			logger.Error(err, "failed to create ingress")
+			return err
+		} else {
+			logger.Info("created gitea ingress", "IngressName", gitea.Name)
+		}
+	} else {
+		return err
+	}
+	return nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *GiteaReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	builder := ctrl.NewControllerManagedBy(mgr).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 3}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.Secret{}).
+		Owns(&corev1.ServiceAccount{}).
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&netv1.Ingress{}).
+		For(&hyperv1.Gitea{})
+
+	// External instances do not require a database operator at all. Register
+	// watches only for providers whose CRDs are actually installed.
+	if checkCRDExists(zalandov1.SchemeGroupVersion.WithKind("Postgresql")) {
+		builder = builder.Owns(&zalandov1.Postgresql{})
+	}
+	if checkCRDExists(cnpgv1.SchemeGroupVersion.WithKind("Cluster")) {
+		builder = builder.Owns(&cnpgv1.Cluster{})
+	}
+	return builder.Complete(r)
+}
+
+func checkCRDExists(gvk schema.GroupVersionKind) bool {
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return false
+	}
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return false
+	}
+	apiResourceLists, err := dc.ServerResourcesForGroupVersion(gvk.GroupVersion().String())
+	if err != nil {
+		return false
+	}
+	for _, apiResource := range apiResourceLists.APIResources {
+		if apiResource.Kind == gvk.Kind {
+			return true
+		}
+	}
+	return false
+}

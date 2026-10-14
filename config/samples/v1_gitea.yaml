@@ -1,0 +1,15 @@
+apiVersion: hyperspike.io/v1
+kind: Gitea
+metadata:
+  labels:
+    app.kubernetes.io/name: forgejo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: forgejo
+spec:
+  managementPolicy: Managed
+  deletionPolicy: Retain
+  image: codeberg.org/forgejo/forgejo:16.0.2-rootless
+  rootless: true
+  postgres:
+    provider: cnpg # or zalando (default)
+  valkey: true

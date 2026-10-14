@@ -1,0 +1,14 @@
+apiVersion: hyperspike.io/v1
+kind: Gitea
+metadata:
+  name: forgejo
+  namespace: forgejo
+spec:
+  managementPolicy: External
+  connection:
+    service:
+      name: forgejo
+      port: 3000
+    adminTokenSecretRef:
+      name: forgejo-operator-admin
+      key: token
